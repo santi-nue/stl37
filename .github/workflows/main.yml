@@ -22,9 +22,9 @@ jobs:
       - name: Download msvc
         run: |
           python.exe portable-msvc.py
-          tar -cvf msvc.tar *
+          # tar -cvf msvc.tar *
 
       - uses: actions/upload-artifact@v3
         with:
           name: msvcdownloaded
-          path: msvc.tar
+          path: .
