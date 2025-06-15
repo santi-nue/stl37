@@ -181,10 +181,10 @@ tools = first(manifest["channelItems"], lambda x: x["id"] == "Microsoft.VisualSt
 resource = first(tools["localizedResources"], lambda x: x["language"] == "en-us")
 license = resource["license"]
 
-if not args.accept_license:
-  accept = input(f"Do you accept Visual Studio license at {license} [Y/N] ? ")
-  if not accept or accept[0].lower() != "y":
-    sys.exit(0)
+# if not args.accept_license:
+#  accept = input(f"Do you accept Visual Studio license at {license} [Y/N] ? ")
+#  if not accept or accept[0].lower() != "y":
+#    sys.exit(0)
 
 OUTPUT.mkdir(exist_ok=True)
 DOWNLOADS.mkdir(exist_ok=True)
