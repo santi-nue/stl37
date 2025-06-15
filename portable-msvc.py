@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import io
+import os
+import sys
+import stat
 import json
 import shutil
 import hashlib
@@ -8,43 +11,62 @@ import zipfile
 import tempfile
 import argparse
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-OUTPUT = Path("msvc") # output folder
-TEMP = Path(".").absolute()
+OUTPUT = Path("msvc")         # output folder
+DOWNLOADS = Path("downloads") # temporary download files
 
-# other architectures may work or may not - not really tested
-HOST   = "x64" # or x86
-TARGET = "x64" # or x86, arm, arm64
+# NOTE: not all host & target architecture combinations are supported
+
+DEFAULT_HOST = "x64"
+ALL_HOSTS    = "x64 x86 arm64".split()
+
+DEFAULT_TARGET = "x64"
+ALL_TARGETS    = "x64 x86 arm arm64".split()
 
 MANIFEST_URL = "https://aka.ms/vs/17/release/channel"
+MANIFEST_PREVIEW_URL = "https://aka.ms/vs/17/pre/channel"
 
+ssl_context = None
 
 def download(url):
-  with urllib.request.urlopen(url) as res:
+  with urllib.request.urlopen(url, context=ssl_context) as res:
     return res.read()
 
-def download_progress(url, check, name, f):
-  data = io.BytesIO()
-  with urllib.request.urlopen(url) as res:
-    total = int(res.headers["Content-Length"])
-    size = 0
-    while True:
-      block = res.read(1<<20)
-      if not block:
-        break
-      f.write(block)
-      data.write(block)
-      size += len(block)
-      perc = size * 100 // total
-      print(f"\r{name} ... {perc}%", end="")
-  print()
-  data = data.getvalue()
-  digest = hashlib.sha256(data).hexdigest()
-  if check.lower() != digest:
-    exit(f"Hash mismatch for f{pkg}")
-  return data
+total_download = 0
+
+def download_progress(url, check, filename):
+  fpath = DOWNLOADS / filename
+  if fpath.exists():
+    data = fpath.read_bytes()
+    if hashlib.sha256(data).hexdigest() == check.lower():
+      print(f"\r{filename} ... OK")
+      return data
+
+  global total_download
+  with fpath.open("wb") as f:
+    data = io.BytesIO()
+    with urllib.request.urlopen(url, context=ssl_context) as res:
+      total = int(res.headers["Content-Length"])
+      size = 0
+      while True:
+        block = res.read(1<<20)
+        if not block:
+          break
+        f.write(block)
+        data.write(block)
+        size += len(block)
+        perc = size * 100 // total
+        print(f"\r{filename} ... {perc}%", end="")
+    print()
+    data = data.getvalue()
+    digest = hashlib.sha256(data).hexdigest()
+    if check.lower() != digest:
+      sys.exit(f"Hash mismatch for f{pkg}")
+    total_download += len(data)
+    return data
 
 # super crappy msi format parser just to find required .cab files
 def get_msi_cabs(msi):
@@ -55,28 +77,57 @@ def get_msi_cabs(msi):
       return
     yield msi[index-32:index+4].decode("ascii")
 
-def first(items, cond):
-  return next(item for item in items if cond(item))
-
+def first(items, cond = lambda x: True):
+  return next((item for item in items if cond(item)), None)
+  
 
 ### parse command-line arguments
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--show-versions", const=True, action="store_const", help="Show available MSVC and Windows SDK versions")
-ap.add_argument("--accept-license", const=True, action="store_const", help="Automatically accept license")
+ap.add_argument("--show-versions", action="store_true", help="Show available MSVC and Windows SDK versions")
+ap.add_argument("--accept-license", action="store_true", help="Automatically accept license")
 ap.add_argument("--msvc-version", help="Get specific MSVC version")
 ap.add_argument("--sdk-version", help="Get specific Windows SDK version")
+ap.add_argument("--preview", action="store_true", help="Use preview channel for Preview versions")
+ap.add_argument("--target", default=DEFAULT_TARGET, help=f"Target architectures, comma separated ({','.join(ALL_TARGETS)})")
+ap.add_argument("--host", default=DEFAULT_HOST, help=f"Host architecture", choices=ALL_HOSTS)
 args = ap.parse_args()
+
+host = args.host
+targets = args.target.split(',')
+for target in targets:
+  if target not in ALL_TARGETS:
+    sys.exit(f"Unknown {target} target architecture!")
 
 
 ### get main manifest
 
-manifest = json.loads(download(MANIFEST_URL))
+URL = MANIFEST_PREVIEW_URL if args.preview else MANIFEST_URL
 
+try:
+  manifest = json.loads(download(URL))
+except urllib.error.URLError as err:
+  import ssl
+  if isinstance(err.args[0], ssl.SSLCertVerificationError):
+    # for more info about Python & issues with Windows certificates see https://stackoverflow.com/a/52074591
+    print("ERROR: ssl certificate verification error")
+    try:
+      import certifi
+    except ModuleNotFoundError:
+      print("ERROR: please install 'certifi' package to use Mozilla certificates")
+      print("ERROR: or update your Windows certs, see instructions here: https://woshub.com/updating-trusted-root-certificates-in-windows-10/#h2_3")
+      sys.exit()
+    print("NOTE: retrying with certifi certificates")
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    manifest = json.loads(download(URL))
+  else:
+    raise
 
 ### download VS manifest
 
-vs = first(manifest["channelItems"], lambda x: x["id"] == "Microsoft.VisualStudio.Manifests.VisualStudio")
+ITEM_NAME = "Microsoft.VisualStudio.Manifests.VisualStudioPreview" if args.preview else "Microsoft.VisualStudio.Manifests.VisualStudio"
+
+vs = first(manifest["channelItems"], lambda x: x["id"] == ITEM_NAME)
 payload = vs["payloads"][0]["url"]
 
 vsmanifest = json.loads(download(payload))
@@ -92,8 +143,8 @@ msvc = {}
 sdk = {}
 
 for pid,p in packages.items():
-  if pid.startswith("Microsoft.VisualStudio.Component.VC.".lower()) and pid.endswith(".x86.x64".lower()):
-    pver = ".".join(pid.split(".")[4:6])
+  if pid.startswith("Microsoft.VC.".lower()) and pid.endswith(".Tools.HostX64.TargetX64.base".lower()):
+    pver = ".".join(pid.split(".")[2:4])
     if pver[0].isnumeric():
       msvc[pver] = pid
   elif pid.startswith("Microsoft.VisualStudio.Component.Windows10SDK.".lower()) or \
@@ -105,21 +156,21 @@ for pid,p in packages.items():
 if args.show_versions:
   print("MSVC versions:", " ".join(sorted(msvc.keys())))
   print("Windows SDK versions:", " ".join(sorted(sdk.keys())))
-  exit(0)
+  sys.exit(0)
 
 msvc_ver = args.msvc_version or max(sorted(msvc.keys()))
 sdk_ver = args.sdk_version or max(sorted(sdk.keys()))
 
 if msvc_ver in msvc:
   msvc_pid = msvc[msvc_ver]
-  msvc_ver = ".".join(msvc_pid.split(".")[4:-2])
+  msvc_ver = ".".join(msvc_pid.split(".")[2:6])
 else:
-  exit(f"Unknown MSVC version: f{args.msvc_version}")
+  sys.exit(f"Unknown MSVC version: f{args.msvc_version}")
 
 if sdk_ver in sdk:
   sdk_pid = sdk[sdk_ver]
 else:
-  exit(f"Unknown Windows SDK version: f{args.sdk_version}")
+  sys.exit(f"Unknown Windows SDK version: f{args.sdk_version}")
 
 print(f"Downloading MSVC v{msvc_ver} and Windows SDK v{sdk_ver}")
 
@@ -130,206 +181,196 @@ tools = first(manifest["channelItems"], lambda x: x["id"] == "Microsoft.VisualSt
 resource = first(tools["localizedResources"], lambda x: x["language"] == "en-us")
 license = resource["license"]
 
-# if not args.accept_license:
-#   accept = input(f"Do you accept Visual Studio license at {license} [Y/N] ? ")
-#  if not accept or accept[0].lower() != "y":
-#    exit(0)
+if not args.accept_license:
+  accept = input(f"Do you accept Visual Studio license at {license} [Y/N] ? ")
+  if not accept or accept[0].lower() != "y":
+    sys.exit(0)
 
 OUTPUT.mkdir(exist_ok=True)
-total_download = 0
+DOWNLOADS.mkdir(exist_ok=True)
+
 
 ### download MSVC
 
 msvc_packages = [
-  # MSVC binaries
-  f"microsoft.vc.{msvc_ver}.tools.host{HOST}.target{TARGET}.base",
-  f"microsoft.vc.{msvc_ver}.tools.host{HOST}.target{TARGET}.res.base",
-  # MSVC headers
+  f"microsoft.visualcpp.dia.sdk",
   f"microsoft.vc.{msvc_ver}.crt.headers.base",
-  # MSVC libs
-  f"microsoft.vc.{msvc_ver}.crt.{TARGET}.desktop.base",
-  f"microsoft.vc.{msvc_ver}.crt.{TARGET}.store.base",
-  # MSVC runtime source
   f"microsoft.vc.{msvc_ver}.crt.source.base",
-  # ASAN
   f"microsoft.vc.{msvc_ver}.asan.headers.base",
-  f"microsoft.vc.{msvc_ver}.asan.{TARGET}.base",
-  # MSVC redist
-  #f"microsoft.vc.{msvc_ver}.crt.redist.x64.base",
+  f"microsoft.vc.{msvc_ver}.pgo.headers.base",
 ]
 
-for pkg in msvc_packages:
+for target in targets:
+  msvc_packages += [
+    f"microsoft.vc.{msvc_ver}.tools.host{host}.target{target}.base",
+    f"microsoft.vc.{msvc_ver}.tools.host{host}.target{target}.res.base",
+    f"microsoft.vc.{msvc_ver}.crt.{target}.desktop.base",
+    f"microsoft.vc.{msvc_ver}.crt.{target}.store.base",
+    f"microsoft.vc.{msvc_ver}.premium.tools.host{host}.target{target}.base",
+    f"microsoft.vc.{msvc_ver}.pgo.{target}.base",
+  ]
+  if target in ["x86", "x64"]:
+    msvc_packages += [f"microsoft.vc.{msvc_ver}.asan.{target}.base"]
+
+  redist_suffix = ".onecore.desktop" if target == "arm" else ""
+  redist_pkg = f"microsoft.vc.{msvc_ver}.crt.redist.{target}{redist_suffix}.base"
+  if redist_pkg not in packages:
+    redist_name = f"microsoft.visualcpp.crt.redist.{target}{redist_suffix}"
+    redist = first(packages[redist_name])
+    redist_pkg = first(redist["dependencies"], lambda dep: dep.endswith(".base")).lower()
+  msvc_packages += [redist_pkg]
+
+for pkg in sorted(msvc_packages):
+  if pkg not in packages:
+    print(f"\r{pkg} ... !!! MISSING !!!")
+    continue
   p = first(packages[pkg], lambda p: p.get("language") in (None, "en-US"))
   for payload in p["payloads"]:
-    with tempfile.TemporaryFile(dir=TEMP) as f:
-      data = download_progress(payload["url"], payload["sha256"], pkg, f)
-      total_download += len(data)
-      with zipfile.ZipFile(f) as z:
-        for name in z.namelist():
-          if name.startswith("Contents/"):
-            out = OUTPUT / Path(name).relative_to("Contents")
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(z.read(name))
+    filename = payload["fileName"]
+    download_progress(payload["url"], payload["sha256"], filename)
+    with zipfile.ZipFile(DOWNLOADS / filename) as z:
+      for name in z.namelist():
+        if name.startswith("Contents/"):
+          out = OUTPUT / Path(name).relative_to("Contents")
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_bytes(z.read(name))
 
 
 ### download Windows SDK
 
 sdk_packages = [
-  # Windows SDK tools (like rc.exe & mt.exe)
   f"Windows SDK for Windows Store Apps Tools-x86_en-us.msi",
-  # Windows SDK headers
   f"Windows SDK for Windows Store Apps Headers-x86_en-us.msi",
-  f"Windows SDK Desktop Headers x86-x86_en-us.msi",
-  # Windows SDK libs
+  f"Windows SDK for Windows Store Apps Headers OnecoreUap-x86_en-us.msi",
   f"Windows SDK for Windows Store Apps Libs-x86_en-us.msi",
-  f"Windows SDK Desktop Libs {TARGET}-x86_en-us.msi",
-  # CRT headers & libs
   f"Universal CRT Headers Libraries and Sources-x86_en-us.msi",
-  # CRT redist
-  #"Universal CRT Redistributable-x86_en-us.msi",
 ]
 
-with tempfile.TemporaryDirectory(dir=TEMP) as d:
+for target in ALL_TARGETS:
+  sdk_packages += [
+    f"Windows SDK Desktop Headers {target}-x86_en-us.msi",
+    f"Windows SDK OnecoreUap Headers {target}-x86_en-us.msi",
+  ]
+
+for target in targets:
+  sdk_packages += [f"Windows SDK Desktop Libs {target}-x86_en-us.msi"]
+
+with tempfile.TemporaryDirectory(dir=DOWNLOADS) as d:
   dst = Path(d)
 
   sdk_pkg = packages[sdk_pid][0]
-  sdk_pkg = packages[first(sdk_pkg["dependencies"], lambda x: True).lower()][0]
+  sdk_pkg = packages[first(sdk_pkg["dependencies"]).lower()][0]
 
   msi = []
   cabs = []
 
   # download msi files
-  for pkg in sdk_packages:
+  for pkg in sorted(sdk_packages):
     payload = first(sdk_pkg["payloads"], lambda p: p["fileName"] == f"Installers\\{pkg}")
-    msi.append(dst / pkg)
-    with open(dst / pkg, "wb") as f:
-      data = download_progress(payload["url"], payload["sha256"], pkg, f)
-      total_download += len(data)
-      cabs += list(get_msi_cabs(data))
+    if payload is None:
+      continue
+    msi.append(DOWNLOADS / pkg)
+    data = download_progress(payload["url"], payload["sha256"], pkg)
+    cabs += list(get_msi_cabs(data))
 
   # download .cab files
   for pkg in cabs:
     payload = first(sdk_pkg["payloads"], lambda p: p["fileName"] == f"Installers\\{pkg}")
-    with open(dst / pkg, "wb") as f:
-      download_progress(payload["url"], payload["sha256"], pkg, f)
+    download_progress(payload["url"], payload["sha256"], pkg)
 
   print("Unpacking msi files...")
 
   # run msi installers
   for m in msi:
-    subprocess.check_call(["msiexec.exe", "/a", m, "/quiet", "/qn", f"TARGETDIR={OUTPUT.resolve()}"])
+    subprocess.check_call(f'msiexec.exe /a "{m}" /quiet /qn TARGETDIR="{OUTPUT.resolve()}"')
+    (OUTPUT / m.name).unlink()
 
 
 ### versions
 
-msvcv = list((OUTPUT / "VC/Tools/MSVC").glob("*"))[0].name
-sdkv = list((OUTPUT / "Windows Kits/10/bin").glob("*"))[0].name
+msvcv = first((OUTPUT / "VC/Tools/MSVC").glob("*")).name
+sdkv = first((OUTPUT / "Windows Kits/10/bin").glob("*")).name
 
 
-# place debug CRT runtime files into MSVC folder (not what real Visual Studio installer does... but is reasonable)
+# place debug CRT runtime files into MSVC bin folder (not what real Visual Studio installer does... but is reasonable)
+# NOTE: these are Target architecture, not Host architecture binaries
 
-dst = OUTPUT / "VC/Tools/MSVC" / msvcv / f"bin/Host{HOST}/{TARGET}"
+redist = OUTPUT / "VC/Redist"
 
-with tempfile.TemporaryDirectory(dir=TEMP) as d:
-  d = Path(d)
-  pkg = "microsoft.visualcpp.runtimedebug.14"
-  dbg = first(packages[pkg], lambda p: p["chip"] == HOST)
-  for payload in dbg["payloads"]:
-    name = payload["fileName"]
-    with open(d / name, "wb") as f:
-      data = download_progress(payload["url"], payload["sha256"], f"{pkg}/{name}", f)
-      total_download += len(data)
-  msi = d / first(dbg["payloads"], lambda p: p["fileName"].endswith(".msi"))["fileName"]
-
-  with tempfile.TemporaryDirectory(dir=TEMP) as d2:
-    subprocess.check_call(["msiexec.exe", "/a", str(msi), "/quiet", "/qn", f"TARGETDIR={d2}"])
-    for f in first(Path(d2).glob("System*"), lambda x: True).iterdir():
+if redist.exists():
+  redistv = first((redist / "MSVC").glob("*")).name
+  src = redist / "MSVC" / redistv / "debug_nonredist"
+  for target in targets:
+    for f in (src / target).glob("**/*.dll"):
+      dst = OUTPUT / "VC/Tools/MSVC" / msvcv / f"bin/Host{host}" / target
       f.replace(dst / f.name)
 
-# download DIA SDK and put msdia140.dll file into MSVC folder
+  shutil.rmtree(redist)
 
-with tempfile.TemporaryDirectory(dir=TEMP) as d:
-  d = Path(d)
-  pkg = "microsoft.visualc.140.dia.sdk.msi"
-  dia = packages[pkg][0]
-  for payload in dia["payloads"]:
-    name = payload["fileName"]
-    with open(d / name, "wb") as f:
-      data = download_progress(payload["url"], payload["sha256"], f"{pkg}/{name}", f)
-      total_download += len(data)
-  msi = d / first(dia["payloads"], lambda p: p["fileName"].endswith(".msi"))["fileName"]
 
-  with tempfile.TemporaryDirectory(dir=TEMP) as d2:
-    subprocess.check_call(["msiexec.exe", "/a", str(msi), "/quiet", "/qn", f"TARGETDIR={d2}"])
+# copy msdia140.dll file into MSVC bin folder
+# NOTE: this is meant only for development - always Host architecture, even when placed into all Target architecture folders
 
-    if HOST == "x86": msdia = "msdia140.dll"
-    elif HOST == "x64": msdia = "amd64/msdia140.dll"
-    else: exit("unknown")
+msdia140dll = {
+  "x86": "msdia140.dll",
+  "x64": "amd64/msdia140.dll",
+  "arm": "arm/msdia140.dll",
+  "arm64": "arm64/msdia140.dll",
+}
 
-    src = Path(d2) / "Program Files" / "Microsoft Visual Studio 14.0" / "DIA SDK" / "bin" / msdia
-    src.replace(dst / "msdia140.dll")
+dst = OUTPUT / "VC/Tools/MSVC" / msvcv / f"bin/Host{host}"
+src = OUTPUT / "DIA%20SDK/bin" / msdia140dll[host]
+for target in targets:
+  shutil.copyfile(src, dst / target / src.name)
+
+shutil.rmtree(OUTPUT / "DIA%20SDK")
 
 
 ### cleanup
 
 shutil.rmtree(OUTPUT / "Common7", ignore_errors=True)
-for f in ["Auxiliary", f"lib/{TARGET}/store", f"lib/{TARGET}/uwp"]:
-  shutil.rmtree(OUTPUT / "VC/Tools/MSVC" / msvcv / f)
-for f in OUTPUT.glob("*.msi"):
-  f.unlink()
+shutil.rmtree(OUTPUT / "VC/Tools/MSVC" / msvcv / "Auxiliary")
+for target in targets:
+  for f in [f"store", "uwp", "enclave", "onecore"]:
+    shutil.rmtree(OUTPUT / "VC/Tools/MSVC" / msvcv / "lib" / target / f, ignore_errors=True)
+  shutil.rmtree(OUTPUT / "VC/Tools/MSVC" / msvcv / f"bin/Host{host}" / target / "onecore", ignore_errors=True)
 for f in ["Catalogs", "DesignTime", f"bin/{sdkv}/chpe", f"Lib/{sdkv}/ucrt_enclave"]:
   shutil.rmtree(OUTPUT / "Windows Kits/10" / f, ignore_errors=True)
 for arch in ["x86", "x64", "arm", "arm64"]:
-  if arch != TARGET:
+  if arch not in targets:
+    shutil.rmtree(OUTPUT / "Windows Kits/10/Lib" / sdkv / "ucrt" / arch, ignore_errors=True)
+    shutil.rmtree(OUTPUT / "Windows Kits/10/Lib" / sdkv / "um" / arch, ignore_errors=True)
+  if arch != host:
     shutil.rmtree(OUTPUT / "VC/Tools/MSVC" / msvcv / f"bin/Host{arch}", ignore_errors=True)
-    shutil.rmtree(OUTPUT / "Windows Kits/10/bin" / sdkv / arch)
-    shutil.rmtree(OUTPUT / "Windows Kits/10/Lib" / sdkv / "ucrt" / arch)
-    shutil.rmtree(OUTPUT / "Windows Kits/10/Lib" / sdkv / "um" / arch)
+    shutil.rmtree(OUTPUT / "Windows Kits/10/bin" / sdkv / arch, ignore_errors=True)
 
+# executable that is collecting & sending telemetry every time cl/link runs
+for target in targets:
+  (OUTPUT / "VC/Tools/MSVC" / msvcv / f"bin/Host{host}/{target}/vctip.exe").unlink(missing_ok=True)
+
+
+# extra files for nvcc
+build = OUTPUT / "VC/Auxiliary/Build"
+build.mkdir(parents=True, exist_ok=True)
+(build / "vcvarsall.bat").write_text("rem both bat files are here only for nvcc, do not call them manually")
+(build / "vcvars64.bat").touch()
 
 ### setup.bat
 
-SETUP_BAT = f"""@echo off
+for target in targets:
 
-set ROOT=%~dp0
-
-set MSVC_VERSION={msvcv}
-set MSVC_HOST=Host{HOST}
-set MSVC_ARCH={TARGET}
-set SDK_VERSION={sdkv}
-set SDK_ARCH={TARGET}
-
-set MSVC_ROOT=%ROOT%VC\\Tools\\MSVC\\%MSVC_VERSION%
-set SDK_INCLUDE=%ROOT%Windows Kits\\10\\Include\\%SDK_VERSION%
-set SDK_LIBS=%ROOT%Windows Kits\\10\\Lib\\%SDK_VERSION%
-
-set VCToolsInstallDir=%MSVC_ROOT%\\
-set PATH=%MSVC_ROOT%\\bin\\%MSVC_HOST%\\%MSVC_ARCH%;%ROOT%Windows Kits\\10\\bin\\%SDK_VERSION%\\%SDK_ARCH%;%ROOT%Windows Kits\\10\\bin\\%SDK_VERSION%\\%SDK_ARCH%\\ucrt;%PATH%
-set INCLUDE=%MSVC_ROOT%\\include;%SDK_INCLUDE%\\ucrt;%SDK_INCLUDE%\\shared;%SDK_INCLUDE%\\um;%SDK_INCLUDE%\\winrt;%SDK_INCLUDE%\\cppwinrt
-set LIB=%MSVC_ROOT%\\lib\\%MSVC_ARCH%;%SDK_LIBS%\\ucrt\\%SDK_ARCH%;%SDK_LIBS%\\um\\%SDK_ARCH%
+  SETUP = fr"""@echo off
+set VSCMD_ARG_HOST_ARCH={host}
+set VSCMD_ARG_TGT_ARCH={target}
+set VCToolsVersion={msvcv}
+set WindowsSDKVersion={sdkv}\
+set VCToolsInstallDir=%~dp0VC\Tools\MSVC\{msvcv}\
+set WindowsSdkBinPath=%~dp0Windows Kits\10\bin\
+set PATH=%~dp0VC\Tools\MSVC\{msvcv}\bin\Host{host}\{target};%~dp0Windows Kits\10\bin\{sdkv}\{host};%~dp0Windows Kits\10\bin\{sdkv}\{host}\ucrt;%PATH%
+set INCLUDE=%~dp0VC\Tools\MSVC\{msvcv}\include;%~dp0Windows Kits\10\Include\{sdkv}\ucrt;%~dp0Windows Kits\10\Include\{sdkv}\shared;%~dp0Windows Kits\10\Include\{sdkv}\um;%~dp0Windows Kits\10\Include\{sdkv}\winrt;%~dp0Windows Kits\10\Include\{sdkv}\cppwinrt
+set LIB=%~dp0VC\Tools\MSVC\{msvcv}\lib\{target};%~dp0Windows Kits\10\Lib\{sdkv}\ucrt\{target};%~dp0Windows Kits\10\Lib\{sdkv}\um\{target}
 """
-
-(OUTPUT / "setup.bat").write_text(SETUP_BAT)
-
-### setup.ps1
-
-SETUP_PS1 = f"""$MSVC_VERSION = '{msvcv}'
-$MSVC_HOST = 'Host{HOST}'
-$MSVC_ARCH = '{TARGET}'
-$SDK_VERSION = '{sdkv}'
-$SDK_ARCH = '{TARGET}'
-
-$MSVC_ROOT = "${{PSScriptRoot}}\\VC\\Tools\\MSVC\\${{MSVC_VERSION}}"
-$SDK_INCLUDE = "${{PSScriptRoot}}\\Windows Kits\\10\\Include\\${{SDK_VERSION}}"
-$SDK_LIBS = "${{PSScriptRoot}}\\Windows Kits\\10\\Lib\\${{SDK_VERSION}}"
-
-$env:VCToolsInstallDir = "${{MSVC_ROOT}}\\"
-$env:PATH = "${{MSVC_ROOT}}\\bin\\${{MSVC_HOST}}\\${{MSVC_ARCH}};${{PSScriptRoot}}\\Windows Kits\\10\\bin\\${{SDK_VERSION}}\\${{SDK_ARCH}};${{PSScriptRoot}}\\Windows Kits\\10\\bin\\${{SDK_VERSION}}\\${{SDK_ARCH}}\\ucrt;${{env:PATH}}"
-$env:INCLUDE = "${{MSVC_ROOT}}\\include;${{SDK_INCLUDE}}\\ucrt;${{SDK_INCLUDE}}\\shared;${{SDK_INCLUDE}}\\um;${{SDK_INCLUDE}}\\winrt;${{SDK_INCLUDE}}\\cppwinrt"
-$env:LIB = "${{MSVC_ROOT}}\\lib\\${{MSVC_ARCH}};${{SDK_LIBS}}\\ucrt\\${{SDK_ARCH}};${{SDK_LIBS}}\\um\\${{SDK_ARCH}}"
-"""
-
-(OUTPUT / "setup.ps1").write_text(SETUP_PS1)
+  (OUTPUT / f"setup_{target}.bat").write_text(SETUP)
 
 print(f"Total downloaded: {total_download>>20} MB")
 print("Done!")
